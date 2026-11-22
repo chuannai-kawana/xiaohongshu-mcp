@@ -251,14 +251,12 @@ func (f *CommentFeedAction) PostComment(ctx context.Context, feedID, xsecToken, 
 	logrus.Infof("评论文本已输入并校验，准备查找发布按钮: feed=%s", feedID)
 	installCommentSubmitRecorder(page)
 	submitSelectors := []string{
-		// XHS renders two submit buttons in different component wrappers.
-		// The actual enabled one may be a bare "submit", not "btn submit".
-		"button.submit",
+		// Important: a bare "button.submit" belongs to another active
+		// composer control and its click did NOT generate a comment request.
+		// Use the original bottom-inner/right-btn-area actual submit.
+		".bottom-inner .right-btn-area button.btn.submit",
+		"div.bottom button.btn.submit",
 		"button.btn.submit",
-		".input-box button.submit",
-		"div.bottom button.submit",
-		".interact-container button.submit",
-		".interact-container button[class*='submit']",
 	}
 	submit, err := findActiveSubmitElement(page, submitSelectors, 7*time.Second)
 	if err != nil {
