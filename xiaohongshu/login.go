@@ -195,9 +195,51 @@ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error
 	}
 }
 
-// WaitForLogin waits for this QR scan's session change. An existing guest
-// web_session cookie MUST NOT be mistaken for a new successful QR login.
+// LoginStage is deliberately a small, text-free signal. It does not reveal
+// phone numbers, OTPs, cookies, account details or QR image data.
+func currentQRLoginStage(page *rod.Page) string {
+	res, err := page.Timeout(1200*time.Millisecond).Eval(`() => {
+		const visible = el => {
+			if (!el) return false;
+			const style = getComputedStyle(el);
+			return (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0)
+				&& style.display !== 'none' && style.visibility !== 'hidden';
+		};
+		const inputs = [...document.querySelectorAll('input')].filter(visible);
+		const b = document.body?.innerText || '';
+		const hint = inputs.some(el => /验证码|校验码|otp|verify|one.time.code|sms|短信/i.test([
+			el.placeholder,el.name,el.id,el.getAttribute('autocomplete'),el.getAttribute('aria-label')
+		].filter(Boolean).join(' ')));
+		const sms = /短信验证码|手机验证码|短信校验码|获取短信验证码/i.test(b);
+		const generic = /安全验证|请输入验证码|验证码已发送|输入验证码|身份验证|人机验证/i.test(b) || hint;
+		const phone = /已扫码|扫描成功|请在手机上确认|手机端确认|等待确认登录/i.test(b);
+		const success = /登录成功|扫码登录成功|欢迎回来/i.test(b);
+		const qr = [...document.querySelectorAll('.qrcode-img,.qrcode-container img')]
+			.some(visible);
+		const user = window.__INITIAL_STATE__?.user?.userInfo?.value ||
+			window.__INITIAL_STATE__?.user?.userInfo;
+		const authenticated = !!user && (user.guest === false ||
+			(user.guest !== true && !!(user.userId || user.user_id || user.nickname)));
+		if (authenticated) return 'web_authenticated';
+		if (sms) return 'sms_verification_required';
+		if (generic) return 'verification_required';
+		if (phone) return 'waiting_phone_confirmation';
+		if (success) return 'phone_confirmed';
+		if (qr) return 'waiting_for_scan';
+		return 'waiting_for_web_login';
+	}`)
+	if err != nil { return "waiting_for_web_login" }
+	return res.Value.Str()
+}
+
 func (a *LoginAction) WaitForLogin(ctx context.Context) bool {
+	return a.WaitForLoginWithStage(ctx, nil)
+}
+
+// WaitForLoginWithStage preserves the original cookie-change completion logic,
+// but reports safe UI stages so SMS verification cannot be silently missed.
+// It never attempts to read, submit or store verification codes.
+func (a *LoginAction) WaitForLoginWithStage(ctx context.Context, stageChanged func(string)) bool {
 	pp := a.page.Context(ctx)
 	original := ""
 	if cs, err := pp.Browser().GetCookies(); err == nil {
@@ -206,25 +248,37 @@ func (a *LoginAction) WaitForLogin(ctx context.Context) bool {
 		}
 	}
 	logrus.Infof("qr login: waiting for new session (previous cookie present=%t)", original != "")
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(750*time.Millisecond)
 	defer ticker.Stop()
+	lastStage := ""
 	for {
 		select {
 		case <-ctx.Done():
 			return false
 		case <-ticker.C:
+			stage := currentQRLoginStage(pp)
+			if stage != lastStage {
+				if stageChanged != nil { stageChanged(stage) }
+				logrus.Infof("qr login: page stage=%s", stage)
+				lastStage = stage
+			}
+			if stage == "sms_verification_required" || stage == "verification_required" {
+				// A mobile prompt may be accepted but the browser is waiting
+				// for an additional verification step. Do not save guest cookies.
+				continue
+			}
 			if cs, err := pp.Browser().GetCookies(); err == nil {
 				for _, c := range cs {
 					if c.Name == "web_session" && c.Value != "" && c.Value != original {
 						logrus.Info("qr login: new web_session detected after scan")
+						if stageChanged != nil { stageChanged("session_received") }
 						return true
 					}
 				}
 			}
-			// Also accept a real authenticated user-sidebar on the page.
-			// Unlike the old implementation, do not block waiting for it.
 			if present, _, err := pp.Has(".main-container .user .link-wrapper .channel"); err == nil && present {
 				logrus.Info("qr login: authenticated user sidebar detected")
+				if stageChanged != nil { stageChanged("session_received") }
 				return true
 			}
 		}
