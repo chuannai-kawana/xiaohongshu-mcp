@@ -88,6 +88,105 @@ func commentEditorDiagnostic(page *rod.Page) string {
 	return res.Value.Str()
 }
 
+// installCommentSubmitRecorder collects non-sensitive click and network status
+// metadata for troubleshooting. It never records request bodies, credentials,
+// response data or the user's comment text.
+func installCommentSubmitRecorder(page *rod.Page) {
+	res, err := page.Eval(`() => {
+		if (window.__xhsCommentSubmitProbe) return 'already installed';
+		const history = [];
+		const push = value => {
+			history.push(value);
+			if (history.length > 20) history.shift();
+		};
+		const pathOf = raw => {
+			try { return new URL(typeof raw === 'string' ? raw : raw.url, location.href).pathname; }
+			catch { return ''; }
+		};
+		const isCommentAPI = path => path.includes('/comment/') || path.includes('/comment_');
+		const safeFields = obj => {
+			if (!obj || typeof obj !== 'object') return {};
+			const clean = {};
+			for (const k of ['code','success','msg','message','errorCode','error_code']) {
+				if (Object.hasOwn(obj,k)) {
+					const v = obj[k];
+					if (typeof v === 'boolean' || typeof v === 'number') clean[k] = v;
+					else if (typeof v === 'string') clean[k] = v.slice(0,100);
+				}
+			}
+			return clean;
+		};
+		const oldFetch = window.fetch;
+		window.fetch = function(...args) {
+			const path = pathOf(args[0]);
+			const interested = isCommentAPI(path);
+			if (interested) push({type:'fetch-start',path});
+			return oldFetch.apply(this,args).then(res => {
+				if (interested) {
+					push({type:'fetch-result',path,status:res.status});
+					res.clone().text().then(body => {
+						try { push({type:'fetch-body',path,...safeFields(JSON.parse(body))}) }
+						catch { push({type:'fetch-nonjson',path}) }
+					}).catch(() => {});
+				}
+				return res;
+			},e => {
+				if (interested) push({type:'fetch-failed',path,error:String(e).slice(0,90)});
+				throw e;
+			});
+		};
+		const oldOpen = XMLHttpRequest.prototype.open;
+		XMLHttpRequest.prototype.open = function(method,url,...rest) {
+			this.__xhsCommentPath = pathOf(url);
+			return oldOpen.call(this,method,url,...rest);
+		};
+		const oldSend = XMLHttpRequest.prototype.send;
+		XMLHttpRequest.prototype.send = function(...args) {
+			const path = this.__xhsCommentPath;
+			if (isCommentAPI(path)) {
+				push({type:'xhr-start',path});
+				this.addEventListener('loadend',() => {
+					push({type:'xhr-result',path,status:this.status});
+					try { if (!this.responseType || this.responseType === 'text')
+						push({type:'xhr-body',path,...safeFields(JSON.parse(this.responseText))}) }
+					catch {}
+				},{once:true});
+			}
+			return oldSend.apply(this,args);
+		};
+		document.addEventListener('click',e => {
+			const btn = e.target.closest('button');
+			if (btn && btn.classList.contains('submit')) {
+				push({type:'submit-click',cls:String(btn.className).slice(0,80),
+					disabled:!!btn.disabled,insideInputBox:!!btn.closest('.input-box')});
+			}
+		},true);
+		window.__xhsCommentSubmitProbe = history;
+		return 'installed';
+	}`)
+	if err != nil { logrus.Warnf("评论发送诊断初始化失败: %v",err) }
+	else { logrus.Infof("评论发送诊断状态: %s",res.Value.Str()) }
+}
+
+func commentSubmitRecorderReport(page *rod.Page, content string) string {
+	res, err := page.Eval(`(txt) => {
+		const el = document.querySelector('div.input-box div.content-edit p.content-input');
+		const buttons = [...document.querySelectorAll('button.submit')].map(btn=>({
+			cls:String(btn.className).slice(0,80),disabled:!!btn.disabled,
+			opacity:getComputedStyle(btn).opacity,
+			insideInputBox:!!btn.closest('.input-box'),
+		}));
+		const toast = [...document.querySelectorAll('[role="alert"],.el-message,.toast')]
+			.slice(0,8).map(e=>String(e.innerText||''))
+			.filter(x=>/失败|频繁|限制|异常|登录|验证|错误|成功|error|rate|captcha/i.test(x))
+			.map(x=>x.slice(0,80));
+		return JSON.stringify({editorMatches:!!el&&el.innerText.trim()===txt,
+			buttons,network:window.__xhsCommentSubmitProbe||[],toasts:toast});
+	}`,content)
+	if err != nil { return "unavailable:"+err.Error() }
+	return res.Value.Str()
+}
+
 // PostComment writes only after verifying the editor contains exactly approved text.
 func (f *CommentFeedAction) PostComment(ctx context.Context, feedID, xsecToken, content string) error {
 	page := f.page.Timeout(40 * time.Second)
@@ -151,6 +250,7 @@ func (f *CommentFeedAction) PostComment(ctx context.Context, feedID, xsecToken, 
 		return fmt.Errorf("评论框激活后内容发生变化，已取消发送")
 	}
 	logrus.Infof("评论文本已输入并校验，准备查找发布按钮: feed=%s", feedID)
+	installCommentSubmitRecorder(page)
 	submitSelectors := []string{
 		// XHS renders two submit buttons in different component wrappers.
 		// The actual enabled one may be a bare "submit", not "btn submit".
@@ -175,6 +275,7 @@ func (f *CommentFeedAction) PostComment(ctx context.Context, feedID, xsecToken, 
 	}
 	humanize.Delay(ctx, humanize.AfterClick)
 	if !waitCommentRendered(page, content, 5*time.Second) {
+		logrus.Warnf("评论提交诊断（仅状态与路径）: %s", commentSubmitRecorderReport(page, content))
 		logrus.Warnf("点击提交后未在评论列表确认，需人工检查是否发布: feed=%s", feedID)
 		return fmt.Errorf("已点击发表评论，但暂未能确认是否成功；请先在小红书 App 检查，避免重复")
 	}
