@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-rod/rod"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 type LoginAction struct {
@@ -88,26 +89,57 @@ func (a *LoginAction) Login(ctx context.Context) error {
 }
 
 func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error) {
-	pp := a.page.Context(ctx)
+	// Keep this operation below the MCP gateway timeout. Waiting for the full
+	// page load can hang indefinitely on analytics/third-party resources.
+	opCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	pp := a.page.Context(opCtx)
+	start := time.Now()
 
-	// 导航到小红书首页，这会触发二维码弹窗
-	pp.MustNavigate("https://www.xiaohongshu.com/explore").MustWaitLoad()
-
-	time.Sleep(2 * time.Second)
-
-	if exists, _, _ := pp.Has(".main-container .user .link-wrapper .channel"); exists {
-		return "", true, nil
+	logrus.Info("qr login: navigating to explore")
+	if err := pp.Navigate("https://www.xiaohongshu.com/explore"); err != nil {
+		logrus.Warnf("qr login: navigation failed after %s: %v", time.Since(start), err)
+		return "", false, errors.Wrap(err, "qr login navigation failed")
 	}
+	logrus.Infof("qr login: navigation returned after %s; waiting for login dialog", time.Since(start))
 
-	src, err := pp.MustElement(".login-container .qrcode-img").Attribute("src")
-	if err != nil {
-		return "", false, errors.Wrap(err, "get qrcode src failed")
+	// Only inspect QR-code-looking images. Generic images could be avatars or
+	// decorative icons and must not be exposed as a login QR code.
+	selectors := []string{
+		".login-container .qrcode-img",
+		".login-container img.qrcode",
+		".login-container img[src^='data:image/']",
+		".qrcode-container img",
 	}
-	if src == nil || len(*src) == 0 {
-		return "", false, errors.New("qrcode src is empty")
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if opCtx.Err() != nil {
+			logrus.Warnf("qr login: no QR image after %s (dialog absent or page blocked)", time.Since(start))
+			return "", false, errors.Wrap(opCtx.Err(), "qr login image not found within 45s")
+		}
+		if loggedIn, _, err := pp.Has(".main-container .user .link-wrapper .channel"); err == nil && loggedIn {
+			logrus.Infof("qr login: already signed in after %s", time.Since(start))
+			return "", true, nil
+		}
+		for _, selector := range selectors {
+			found, el, err := pp.Has(selector)
+			if err != nil || !found || el == nil {
+				continue
+			}
+			src, err := el.Attribute("src")
+			if err == nil && src != nil && len(*src) != 0 {
+				logrus.Infof("qr login: QR image found after %s (selector %s)", time.Since(start), selector)
+				return *src, false, nil
+			}
+		}
+		select {
+		case <-opCtx.Done():
+			logrus.Warnf("qr login: timed out after %s waiting for QR", time.Since(start))
+			return "", false, errors.Wrap(opCtx.Err(), "qr login image not found within 45s")
+		case <-ticker.C:
+		}
 	}
-
-	return *src, false, nil
 }
 
 func (a *LoginAction) WaitForLogin(ctx context.Context) bool {
