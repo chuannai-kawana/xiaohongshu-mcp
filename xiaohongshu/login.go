@@ -207,15 +207,19 @@ func currentQRLoginStage(page *rod.Page) string {
 		};
 		const inputs = [...document.querySelectorAll('input')].filter(visible);
 		const b = document.body?.innerText || '';
-		const hint = inputs.some(el => /验证码|校验码|otp|verify|one.time.code|sms|短信/i.test([
+		const inputDetails = inputs.map(el => [
 			el.placeholder,el.name,el.id,el.getAttribute('autocomplete'),el.getAttribute('aria-label')
-		].filter(Boolean).join(' ')));
-		const sms = /短信验证码|手机验证码|短信校验码|获取短信验证码/i.test(b);
-		const generic = /安全验证|请输入验证码|验证码已发送|输入验证码|身份验证|人机验证/i.test(b) || hint;
+		].filter(Boolean).join(' '));
+		const codeInput = inputDetails.some(x => /验证码|校验码|otp|one.time.code|短信|sms/i.test(x));
 		const phone = /已扫码|扫描成功|请在手机上确认|手机端确认|等待确认登录/i.test(b);
 		const success = /登录成功|扫码登录成功|欢迎回来/i.test(b);
 		const qr = [...document.querySelectorAll('.qrcode-img,.qrcode-container img')]
 			.some(visible);
+		// Text such as "验证码登录" can be a static alternative login tab.
+		// A visible QR alone is not evidence that a code must be entered.
+		const sms = codeInput && /短信验证码|手机验证码|短信校验码|获取短信验证码/i.test(b);
+		const generic = codeInput ||
+			(!qr && /安全验证|请输入验证码|验证码已发送|输入验证码|身份验证|人机验证/i.test(b));
 		const user = window.__INITIAL_STATE__?.user?.userInfo?.value ||
 			window.__INITIAL_STATE__?.user?.userInfo;
 		const authenticated = !!user && (user.guest === false ||
