@@ -49,7 +49,13 @@ func commentEditorDiagnostic(page *rod.Page) string {
 			.map(el => ({tag:el.tagName, cls:String(el.className).slice(0,80),
 				visible:!!(el.offsetWidth||el.offsetHeight||el.getClientRects().length)}));
 		return JSON.stringify({path:location.pathname, counts:Object.fromEntries(
-			sels.map(s=>[s,document.querySelectorAll(s).length])), editors:els});
+			sels.map(s=>[s,document.querySelectorAll(s).length])), editors:els,
+			buttons:Array.from(document.querySelectorAll('button.submit')).slice(0,3).map(el=>({
+				disabled:el.disabled,ariaDisabled:el.getAttribute('aria-disabled'),
+				className:String(el.className).slice(0,100),opacity:getComputedStyle(el).opacity,
+				parentOpacity:getComputedStyle(el.parentElement).opacity,
+				visible:!!(el.offsetWidth||el.offsetHeight||el.getClientRects().length)
+			}))});
 	}`)
 	if err != nil { return "unavailable: " + err.Error() }
 	return res.Value.Str()
@@ -96,28 +102,26 @@ func (f *CommentFeedAction) PostComment(ctx context.Context, feedID, xsecToken, 
 	}
 	// Contenteditable editors may fail WaitInteractable despite being visible.
 	// Focus the editable node directly; Type also validates writability.
-	// Some XHS layouts require a real click on the placeholder/container to
-	// expand the comment composer. Focus alone can leave submit opacity at zero.
-	activators := []string{
-		"div.input-box div.content-edit span",
-		"div.input-box div.content-edit",
-	}
-	if activator, err := findVisibleCommentElement(page, activators, 2*time.Second); err == nil {
-		if clickErr := humanize.ClickNoWait(activator); clickErr != nil {
-			logrus.Infof("评论框激活点击未成功（将继续聚焦）: %v", clickErr)
-		} else {
-			humanize.Delay(ctx, humanize.AfterClick)
-			if updated, err := findVisibleCommentElement(page, editors, 2*time.Second); err == nil {
-				elem = updated
-			}
-		}
-	}
 	if err := elem.Focus(); err != nil { return fmt.Errorf("聚焦评论输入框失败: %w", err) }
 	if err := humanize.Type(ctx, elem, content); err != nil { return fmt.Errorf("输入评论失败: %w", err) }
 	humanize.Delay(ctx, humanize.AfterType)
 	typed, err := elem.Text()
 	if err != nil || typed != content {
 		return fmt.Errorf("评论输入校验失败，已取消发送（输入长度=%d，预期长度=%d）", len(typed), len(content))
+	}
+	// Focusing the editor is sufficient for typing, but XHS sometimes
+	// requires an explicit click on the composer to reveal/enable submit.
+	if composer, err := findVisibleCommentElement(page, []string{"div.input-box div.content-edit"}, 2*time.Second); err == nil {
+		if err := humanize.ClickNoWait(composer); err != nil {
+			logrus.Warnf("评论框激活点击失败: %v", err)
+		}
+		humanize.Delay(ctx, humanize.AfterClick)
+	}
+	// Re-check CURRENT DOM after React may have re-rendered the editor.
+	matched, matchErr := page.Eval("(txt) => { const el = document.querySelector('div.input-box div.content-edit p.content-input'); return !!el && el.innerText.trim() === txt; }", content)
+	if matchErr != nil || !matched.Value.Bool() {
+		logrus.Warnf("激活后当前输入框文本不再匹配，已停止发送: %s", commentEditorDiagnostic(page))
+		return fmt.Errorf("评论框激活后内容发生变化，已取消发送")
 	}
 	logrus.Infof("评论文本已输入并校验，准备查找发布按钮: feed=%s", feedID)
 	submitSelectors := []string{
