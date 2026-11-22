@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/url"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
