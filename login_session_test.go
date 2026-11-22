@@ -105,3 +105,14 @@ func TestLoginSessionsExpiredQR(t *testing.T) {
 	_, _, ok := l.currentQR()
 	assert.False(t, ok, "过期二维码不得继续复用")
 }
+
+func TestLoginSessionsOldStageCannotOverwriteNew(t *testing.T) {
+	var l loginSessions
+	old := l.start(func() {}, time.Minute, "old")
+	l.start(func() {}, time.Minute, "new")
+
+	l.setStage(old, "session_received")
+	active, stage, _ := l.snapshot()
+	assert.True(t, active)
+	assert.Equal(t, "waiting_for_scan", stage, "旧会话不得污染新会话状态")
+}
