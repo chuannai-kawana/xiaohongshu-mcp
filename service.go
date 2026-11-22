@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"time"
 
@@ -43,9 +44,13 @@ type PublishRequest struct {
 
 // LoginStatusResponse 登录状态响应
 type LoginStatusResponse struct {
-	IsLoggedIn bool   `json:"is_logged_in"`
-	Username   string `json:"username,omitempty"` // 当前登录账号的昵称
-	UserID     string `json:"user_id,omitempty"`  // 用户唯一标识（个人主页 URL 中的 ID）
+	IsLoggedIn bool   `json:"is_logged_in"` // Cookie detected; not necessarily web-authenticated
+	Username   string `json:"username,omitempty"`
+	UserID     string `json:"user_id,omitempty"`
+	WebAccountState string `json:"web_account_state,omitempty"`
+	QRStage string `json:"qr_stage,omitempty"`
+	QRActive bool `json:"qr_active,omitempty"`
+	QRExpiresAt string `json:"qr_expires_at,omitempty"`
 }
 
 // LoginQrcodeResponse 登录扫码二维码
@@ -105,34 +110,73 @@ func (s *XiaohongshuService) DeleteCookies(ctx context.Context) error {
 }
 
 // CheckLoginStatus 检查登录状态
+// checkPublicWebAuth reads public page-state flags only. This is a diagnostic:
+// a cookie without a web account does not prove posting permission.
+func checkPublicWebAuth(ctx context.Context, page *rod.Page) string {
+	raw := os.Getenv("XHS_AUTH_CHECK_URL")
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Hostname() != "www.xiaohongshu.com" {
+		return "unknown"
+	}
+	pp := page.Context(ctx).Timeout(12*time.Second)
+	if err := pp.Navigate(raw); err != nil {
+		logrus.Warnf("public web account check navigation failed: %v", err)
+		return "unknown"
+	}
+	deadline := time.Now().Add(6*time.Second)
+	for time.Now().Before(deadline) {
+		res, err := pp.Timeout(2*time.Second).Eval(`() => {
+			const raw=window.__INITIAL_STATE__?.user?.userInfo;
+			const user=raw?.value !== undefined ? raw.value : raw;
+			if (!user || typeof user !== 'object') return 'unknown';
+			if (user.guest === true) return 'guest';
+			if (user.guest === false || !!(user.userId||user.user_id||user.nickname)) return 'authenticated';
+			return 'unknown';
+		}`)
+		if err == nil {
+			state := res.Value.Str()
+			if state == "guest" || state == "authenticated" { return state }
+		}
+		time.Sleep(250*time.Millisecond)
+	}
+	return "unknown"
+}
+
+// CheckLoginStatus reports session-cookie presence and page-authentication
+// separately. Pending QR sessions can be checked without opening another
+// Chrome instance, which protects the one-GB service memory cap.
 func (s *XiaohongshuService) CheckLoginStatus(ctx context.Context) (*LoginStatusResponse, error) {
+	active, stage, expires := s.logins.snapshot()
+	if active {
+		return &LoginStatusResponse{
+			QRStage: stage, QRActive: true, QRExpiresAt: expires.UTC().Format(time.RFC3339),
+			WebAccountState: "not_checked_during_scan",
+		}, nil
+	}
+
 	b := newBrowser()
 	defer b.Close()
-
 	page := b.NewPage()
 	defer page.Close()
-
 	loginAction := xiaohongshu.NewLogin(page)
 
-	isLoggedIn, err := loginAction.CheckLoginStatus(ctx)
-	if err != nil {
-		return nil, err
-	}
-
+	cookieDetected, err := loginAction.CheckLoginStatus(ctx)
+	if err != nil { return nil, err }
 	response := &LoginStatusResponse{
-		IsLoggedIn: isLoggedIn,
+		IsLoggedIn: cookieDetected, QRStage: stage,
+		WebAccountState: "unknown",
 	}
-
-	// 已登录时从当前页读取真实账号信息；读不到只记 warn，不影响状态返回。
-	if isLoggedIn {
-		if user, err := loginAction.CurrentUser(ctx); err != nil {
-			logrus.Warnf("failed to get current user info: %v", err)
-		} else {
-			response.Username = user.Nickname
-			response.UserID = user.UserID
+	if cookieDetected {
+		response.WebAccountState = checkPublicWebAuth(ctx, page)
+		// A blank username on the login page is normal, not a reason to
+		// infer an account or to expose private identifiers.
+		if response.WebAccountState == "authenticated" {
+			if user, err := loginAction.CurrentUser(ctx); err == nil {
+				response.Username = user.Nickname
+				response.UserID = user.UserID
+			}
 		}
 	}
-
 	return response, nil
 }
 
@@ -186,7 +230,7 @@ func (s *XiaohongshuService) waitScanInBackground(
 	loginAction *xiaohongshu.LoginAction, page *rod.Page, closeBrowser func(), timeout time.Duration,
 ) {
 	ctxTimeout, cancel := context.WithTimeout(context.Background(), timeout)
-	seq := s.logins.start(cancel)
+	seq := s.logins.start(cancel, timeout)
 	logrus.Infof("等待扫码登录，会话 #%d，超时 %s", seq, timeout)
 
 	go func() {
@@ -194,17 +238,28 @@ func (s *XiaohongshuService) waitScanInBackground(
 		defer cancel()
 		defer s.logins.finish(seq)
 
-		if loginAction.WaitForLogin(ctxTimeout) {
+		if loginAction.WaitForLoginWithStage(ctxTimeout, func(stage string) {
+			s.logins.setStage(seq, stage)
+		}) {
 			if err := saveCookies(page); err != nil {
-				logrus.Errorf("扫码成功但保存 cookies 失败，会话 #%d: %v", seq, err)
+				s.logins.setStage(seq, "cookie_save_failed")
+				logrus.Errorf("扫码后保存 cookies 失败，会话 #%d: %v", seq, err)
 				return
 			}
-			logrus.Infof("扫码登录成功，cookies 已保存，会话 #%d", seq)
+			s.logins.setStage(seq, "session_saved")
+			logrus.Infof("检测到新会话并保存 cookies，会话 #%d；网页认证仍需独立验证", seq)
 			return
 		}
 
-		// 没等到扫码：要么超时，要么被新取的二维码取代
-		logrus.Infof("登录会话 #%d 结束，未检测到扫码（超时或已被新的二维码取代）", seq)
+		// Expired and cancelled attempts are distinguishable from a scan
+		// that reached an official SMS challenge.
+		_, lastStage, _ := s.logins.snapshot()
+		if lastStage == "sms_verification_required" || lastStage == "verification_required" {
+			s.logins.setStage(seq, "verification_timed_out")
+		} else {
+			s.logins.setStage(seq, "qr_expired_or_cancelled")
+		}
+		logrus.Infof("登录会话 #%d 结束，最后页面状态=%s", seq, lastStage)
 	}()
 }
 
