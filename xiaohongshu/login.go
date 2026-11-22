@@ -3,6 +3,9 @@ package xiaohongshu
 import (
 	"context"
 	"encoding/json"
+	"net/url"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -18,34 +21,64 @@ func NewLogin(page *rod.Page) *LoginAction {
 	return &LoginAction{page: page}
 }
 
-// hasSessionCookie checks for Xiaohongshu's authenticated web session without
-// exposing any cookie value to logs. A1 alone is also set for guests.
-func hasSessionCookie(page *rod.Page) bool {
+// authCheckPage returns the site page used to verify an actually signed-in
+// account. It can be set to a public note URL and is restricted to XHS HTTPS.
+func authCheckPage() string {
+	fallback := "https://www.xiaohongshu.com/explore"
+	raw := os.Getenv("XHS_AUTH_CHECK_URL")
+	if raw == "" { return fallback }
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Host != "www.xiaohongshu.com" ||
+		u.User != nil || u.Fragment != "" { return fallback }
+	return raw
+}
+
+func sessionCookieValue(page *rod.Page) string {
 	cs, err := page.Browser().GetCookies()
-	if err != nil {
+	if err != nil { return "" }
+	for _, c := range cs {
+		if c.Name == "web_session" { return c.Value }
+	}
+	return ""
+}
+
+// authenticatedUserState checks the site's actual user state rather than
+// mistaking a stale web_session cookie for a valid login.
+func authenticatedUserState(page *rod.Page) bool {
+	r, err := page.Timeout(3 * time.Second).Eval(`() => {
+		const u = window.__INITIAL_STATE__?.user?.userInfo?.value ||
+			window.__INITIAL_STATE__?.user?.userInfo;
+		return !!u && u.guest !== true &&
+			!!(u.userId || u.user_id || u.nickname);
+	}`)
+	return err == nil && r.Value.Bool()
+}
+
+func verifyAuthenticatedPage(page *rod.Page, ctx context.Context) bool {
+	pp := page.Context(ctx).Timeout(18 * time.Second)
+	if err := pp.Navigate(authCheckPage()); err != nil {
+		logrus.Warnf("auth check navigation failed: %v", err)
 		return false
 	}
-	for _, c := range cs {
-		if c.Name == "web_session" && c.Value != "" {
-			return true
+	ticker := time.NewTicker(400 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(8 * time.Second)
+	defer timeout.Stop()
+	for {
+		if authenticatedUserState(pp) { return true }
+		select {
+		case <-ctx.Done(): return false
+		case <-timeout.C: return false
+		case <-ticker.C:
 		}
 	}
-	return false
 }
 
 func (a *LoginAction) CheckLoginStatus(ctx context.Context) (bool, error) {
-	pp := a.page.Context(ctx).Timeout(20 * time.Second)
-	// The old /explore route can redirect to international RedNote; its
-	// legacy sidebar selector is not present on the Chinese login route.
-	if err := pp.Navigate("https://www.xiaohongshu.com/login"); err != nil {
-		return false, errors.Wrap(err, "navigate to login status page failed")
-	}
-	time.Sleep(2 * time.Second)
-	if hasSessionCookie(pp) {
-		return true, nil
-	}
-	// A missing session cookie is a negative result, not a navigation error.
-	return false, nil
+	if sessionCookieValue(a.page) == "" { return false, nil }
+	// The previous implementation only checked this cookie and returned
+	// success for guests. Verify the user identity flag on a content page.
+	return verifyAuthenticatedPage(a.page, ctx), nil
 }
 
 // CurrentUser 当前登录用户的基础信息。
@@ -197,23 +230,29 @@ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error
 
 func (a *LoginAction) WaitForLogin(ctx context.Context) bool {
 	pp := a.page.Context(ctx)
+	initialCookie := sessionCookieValue(pp)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-
+	started := time.Now()
 	for {
 		select {
-		case <-ctx.Done():
-			return false
+		case <-ctx.Done(): return false
 		case <-ticker.C:
-			// Detect the post-scan web_session cookie. The old sidebar
-			// selector does not exist on /login and misses confirmed scans.
-			if hasSessionCookie(pp) {
-				return true
+			if authenticatedUserState(pp) { return true }
+			current := sessionCookieValue(pp)
+			if current == "" || current == initialCookie { continue }
+			// Do not save cookies as soon as web_session appears: the
+			// browser may still be waiting for the mobile confirmation.
+			visibleQR, _, err := pp.Has(".login-container .qrcode-img")
+			if err == nil && visibleQR {
+				if time.Since(started) < 30*time.Second { continue }
+				// The session may have changed while the login page remains
+				// visible. Verify server-side identity before accepting it.
 			}
-			el, err := pp.Element(".main-container .user .link-wrapper .channel")
-			if err == nil && el != nil {
-				return true
-			}
+			logrus.Info("qr login: session cookie changed; checking authenticated user state")
+			if verifyAuthenticatedPage(pp, ctx) { return true }
+			logrus.Warn("qr login: session cookie present but user state is guest; not saving cookies")
+			return false
 		}
 	}
 }
