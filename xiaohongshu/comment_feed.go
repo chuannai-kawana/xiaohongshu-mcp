@@ -21,67 +21,103 @@ func NewCommentFeedAction(page *rod.Page) *CommentFeedAction {
 }
 
 // PostComment 发表评论到 Feed
-func (f *CommentFeedAction) PostComment(ctx context.Context, feedID, xsecToken, content string) error {
-	// 不使用 Context(ctx)，避免继承外部 context 的超时
-	page := f.page.Timeout(60 * time.Second)
+// findVisibleCommentElement supports both older and newer Xiaohongshu comment editors.
+func findVisibleCommentElement(page *rod.Page, selectors []string, timeout time.Duration) (*rod.Element, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, selector := range selectors {
+			if found, el, err := page.Timeout(2 * time.Second).Has(selector); err == nil && found && el != nil {
+				if visible, err := el.Visible(); err == nil && visible {
+					return el, nil
+				}
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("not found: %v", selectors)
+}
 
+// Diagnostic deliberately avoids logging private cookies, text, or user identifiers.
+func commentEditorDiagnostic(page *rod.Page) string {
+	res, err := page.Timeout(3 * time.Second).Eval(`() => {
+		const sels = ['.interact-container','.input-box','.content-edit',
+			'p.content-input','[contenteditable="true"]','textarea',
+			'.comments-container','.comment-item','button.submit'];
+		const els = Array.from(document.querySelectorAll('[contenteditable], textarea')).slice(0,8)
+			.map(el => ({tag:el.tagName, cls:String(el.className).slice(0,80),
+				visible:!!(el.offsetWidth||el.offsetHeight||el.getClientRects().length)}));
+		return JSON.stringify({path:location.pathname, counts:Object.fromEntries(
+			sels.map(s=>[s,document.querySelectorAll(s).length])), editors:els});
+	}`)
+	if err != nil { return "unavailable: " + err.Error() }
+	return res.Value.Str()
+}
+
+// PostComment writes only after verifying the editor contains exactly approved text.
+func (f *CommentFeedAction) PostComment(ctx context.Context, feedID, xsecToken, content string) error {
+	page := f.page.Timeout(40 * time.Second)
 	url := makeFeedDetailURL(feedID, xsecToken)
 	logrus.Infof("打开 feed 详情页: %s", url)
-
-	// 导航到详情页
-	page.MustNavigate(url)
+	if err := page.Navigate(url); err != nil { return fmt.Errorf("打开笔记页面失败: %w", err) }
 	waitFeedPageReady(page)
 	humanize.Delay(ctx, humanize.AfterNavigate)
+	if err := checkPageAccessible(page); err != nil { return err }
 
-	// 检测页面是否可访问
-	if err := checkPageAccessible(page); err != nil {
-		return err
+	logrus.Infof("评论输入框诊断: %s", commentEditorDiagnostic(page))
+	editors := []string{
+		"div.input-box div.content-edit p.content-input",
+		"div.input-box [contenteditable='true']",
+		".interact-container [contenteditable='true']",
+		".comment-input [contenteditable='true']",
+		".comment-input-box [contenteditable='true']",
+		".comments-container [contenteditable='true']",
 	}
-
-	elem, err := page.Element("div.input-box div.content-edit span")
+	elem, err := findVisibleCommentElement(page, editors, 5*time.Second)
 	if err != nil {
-		logrus.Warnf("Failed to find comment input box: %v", err)
-		return fmt.Errorf("未找到评论输入框，该帖子可能不支持评论或网页端不可访问: %w", err)
+		triggers := []string{
+			"div.input-box div.content-edit span",
+			"div.input-box div.content-edit",
+			".interact-container .input-box",
+			".comment-input-box",
+			".comment-input",
+		}
+		trigger, triggerErr := findVisibleCommentElement(page, triggers, 4*time.Second)
+		if triggerErr == nil {
+			if err := humanize.Click(trigger); err != nil { return fmt.Errorf("打开评论输入区域失败: %w", err) }
+			humanize.Delay(ctx, humanize.AfterClick)
+			elem, err = findVisibleCommentElement(page, editors, 6*time.Second)
+		}
+		if err != nil {
+			logrus.Warnf("新旧评论编辑器均未匹配: %s", commentEditorDiagnostic(page))
+			return fmt.Errorf("未找到可编辑的评论输入框：请检查小红书网页端布局")
+		}
 	}
-
-	if err := humanize.Click(elem); err != nil {
-		logrus.Warnf("Failed to click comment input box: %v", err)
-		return fmt.Errorf("无法点击评论输入框: %w", err)
-	}
-	humanize.Delay(ctx, humanize.AfterClick)
-
-	elem2, err := page.Element("div.input-box div.content-edit p.content-input")
-	if err != nil {
-		logrus.Warnf("Failed to find comment input field: %v", err)
-		return fmt.Errorf("未找到评论输入区域: %w", err)
-	}
-
-	if err := humanize.Type(ctx, elem2, content); err != nil {
-		logrus.Warnf("Failed to input comment content: %v", err)
-		return fmt.Errorf("无法输入评论内容: %w", err)
-	}
-
+	if err := humanize.Click(elem); err != nil { return fmt.Errorf("聚焦评论输入框失败: %w", err) }
+	if err := humanize.Type(ctx, elem, content); err != nil { return fmt.Errorf("输入评论失败: %w", err) }
 	humanize.Delay(ctx, humanize.AfterType)
-
-	submitButton, err := page.Element("div.bottom button.submit")
+	typed, err := elem.Text()
+	if err != nil || typed != content {
+		return fmt.Errorf("评论输入校验失败，已取消发送（输入长度=%d，预期长度=%d）", len(typed), len(content))
+	}
+	logrus.Infof("评论文本已输入并校验，准备查找发布按钮: feed=%s", feedID)
+	submitSelectors := []string{
+		"div.bottom button.submit",
+		".input-box button.submit",
+		".interact-container button.submit",
+		".interact-container button[class*='submit']",
+		".input-box button[class*='submit']",
+	}
+	submit, err := findVisibleCommentElement(page, submitSelectors, 7*time.Second)
 	if err != nil {
-		logrus.Warnf("Failed to find submit button: %v", err)
-		return fmt.Errorf("未找到提交按钮: %w", err)
+		logrus.Warnf("评论提交按钮未找到: %s", commentEditorDiagnostic(page))
+		return fmt.Errorf("评论已输入，但未找到提交按钮，未发送")
 	}
-
-	if err := humanize.Click(submitButton); err != nil {
-		logrus.Warnf("Failed to click submit button: %v", err)
-		return fmt.Errorf("无法点击提交按钮: %w", err)
-	}
-
+	if err := humanize.Click(submit); err != nil { return fmt.Errorf("点击提交按钮失败: %w", err) }
 	humanize.Delay(ctx, humanize.AfterClick)
-
-	// 就地校验：提交后评论应在评论区渲染出现；未出现则判定失败，避免假成功。
-	if !waitCommentRendered(page, content, 4*time.Second) {
-		logrus.Warnf("评论提交后未在评论区渲染，判定未成功: feed=%s", feedID)
-		return fmt.Errorf("评论未确认成功：提交后未在评论区出现（可能账号被限制或发送失败），feed: %s", feedID)
+	if !waitCommentRendered(page, content, 5*time.Second) {
+		logrus.Warnf("点击提交后未在评论列表确认，需人工检查是否发布: feed=%s", feedID)
+		return fmt.Errorf("已点击发表评论，但暂未能确认是否成功；请先在小红书 App 检查，避免重复")
 	}
-
 	logrus.Infof("Comment posted and verified to feed: %s", feedID)
 	return nil
 }
@@ -90,8 +126,8 @@ func (f *CommentFeedAction) PostComment(ctx context.Context, feedID, xsecToken, 
 // 不重新导航、不滚动——只读已加载的 .comments-container 的可见文本。
 func commentRendered(page *rod.Page, content string) bool {
 	res, err := page.Eval(`(txt) => {
-		const c = document.querySelector('.comments-container');
-		return c ? c.innerText.includes(txt) : false;
+		const items = Array.from(document.querySelectorAll('.comments-container .comment-item, .comment-item'));
+		return items.some(el => el.innerText.includes(txt));
 	}`, content)
 	if err != nil {
 		return false
