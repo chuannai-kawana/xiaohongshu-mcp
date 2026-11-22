@@ -138,7 +138,9 @@ func (s *XiaohongshuService) CheckLoginStatus(ctx context.Context) (*LoginStatus
 
 // GetLoginQrcode 获取登录的扫码二维码
 func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeResponse, error) {
+	logrus.Info("qr login: initializing browser")
 	b := newBrowser()
+	logrus.Info("qr login: browser initialized")
 	// 建页和取码都可能 panic。只有后台接手扫码后，才由它关闭浏览器。
 	handedOff := false
 	defer func() {
@@ -147,7 +149,9 @@ func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeRe
 		}
 	}()
 
+	logrus.Info("qr login: creating browser page")
 	page := b.NewPage()
+	logrus.Info("qr login: browser page created")
 	loginAction := xiaohongshu.NewLogin(page)
 
 	img, loggedIn, err := loginAction.FetchQrcodeImage(ctx)
