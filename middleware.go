@@ -2,6 +2,10 @@ package main
 
 import (
 	"crypto/subtle"
+	"bytes"
+	"encoding/json"
+	"io"
+	"time"
 	"net/http"
 	"strings"
 
@@ -59,22 +63,67 @@ func errorHandlingMiddleware() gin.HandlerFunc {
 	})
 }
 
-// browserTrafficLimiter prevents parallel MCP/API requests from launching
-// multiple Chromium processes on the 1 GB Railway instance. In particular,
-// a duplicate write request cannot queue behind another write and then post
-// unexpectedly when the first finishes. Health checks remain unrestricted.
+// isSafeReadRequest only recognizes known read-only MCP calls. It rewinds
+// request bodies so the downstream MCP SDK sees exactly the same bytes.
+// Unknown calls and writes are never placed in the queue.
+func isSafeReadRequest(c *gin.Context) bool {
+	if c.Request.Method == http.MethodGet { return true }
+	if c.Request.Method != http.MethodPost || !strings.HasPrefix(c.Request.URL.Path, "/mcp") {
+		return c.Request.Method == http.MethodGet
+	}
+	if c.Request.Body == nil { return false }
+	const maxPeek = 16384
+	prefix, err := io.ReadAll(io.LimitReader(c.Request.Body, maxPeek+1))
+	c.Request.Body = io.NopCloser(io.MultiReader(bytes.NewReader(prefix), c.Request.Body))
+	if err != nil || len(prefix) > maxPeek { return false }
+	var request struct {
+		Method string `json:"method"`
+		Params struct { Name string `json:"name"` } `json:"params"`
+	}
+	if json.Unmarshal(prefix, &request) != nil { return false }
+	if request.Method == "tools/list" || request.Method == "initialize" || request.Method == "ping" { return true }
+	if request.Method != "tools/call" { return false }
+	switch request.Params.Name {
+	case "check_login_status", "get_feed_detail", "get_feeds_list", "search_feeds", "get_user_profile", "get_user_profile_feeds":
+		return true
+	default:
+		return false
+	}
+}
+
+// Serializes Chromium work on the 1GB service. Only read-only calls wait
+// briefly for the slot. All writes fail fast to prevent delayed duplicate posts.
 func browserTrafficLimiter() gin.HandlerFunc {
-    slots := make(chan struct{}, 1)
-    return func(c *gin.Context) {
-        select {
-        case slots <- struct{}{}:
-            defer func() { <-slots }()
-            c.Next()
-        default:
-            c.Header("Retry-After", "5")
-            c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-                "error": "浏览器正在处理另一项请求，请稍后重试",
-            })
-        }
-    }
+	slots := make(chan struct{}, 1)
+	return func(c *gin.Context) {
+		if isSafeReadRequest(c) {
+			timer := time.NewTimer(20*time.Second)
+			defer timer.Stop()
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+				c.Next()
+				return
+			case <-c.Request.Context().Done():
+				c.AbortWithStatus(http.StatusRequestTimeout)
+				return
+			case <-timer.C:
+				c.Header("Retry-After", "5")
+				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+					"error": "只读请求等待浏览器资源超时，请稍后再试",
+				})
+				return
+			}
+		}
+		select {
+		case slots <- struct{}{}:
+			defer func() { <-slots }()
+			c.Next()
+		default:
+			c.Header("Retry-After", "5")
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+				"error": "浏览器正在处理另一项请求，请稍后重试",
+			})
+		}
+	}
 }
