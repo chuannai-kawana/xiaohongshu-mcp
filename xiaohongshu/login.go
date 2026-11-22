@@ -195,23 +195,36 @@ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error
 	}
 }
 
+// WaitForLogin waits for this QR scan's session change. An existing guest
+// web_session cookie MUST NOT be mistaken for a new successful QR login.
 func (a *LoginAction) WaitForLogin(ctx context.Context) bool {
 	pp := a.page.Context(ctx)
+	original := ""
+	if cs, err := pp.Browser().GetCookies(); err == nil {
+		for _, c := range cs {
+			if c.Name == "web_session" { original = c.Value; break }
+		}
+	}
+	logrus.Infof("qr login: waiting for new session (previous cookie present=%t)", original != "")
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return false
 		case <-ticker.C:
-			// Detect the post-scan web_session cookie. The old sidebar
-			// selector does not exist on /login and misses confirmed scans.
-			if hasSessionCookie(pp) {
-				return true
+			if cs, err := pp.Browser().GetCookies(); err == nil {
+				for _, c := range cs {
+					if c.Name == "web_session" && c.Value != "" && c.Value != original {
+						logrus.Info("qr login: new web_session detected after scan")
+						return true
+					}
+				}
 			}
-			el, err := pp.Element(".main-container .user .link-wrapper .channel")
-			if err == nil && el != nil {
+			// Also accept a real authenticated user-sidebar on the page.
+			// Unlike the old implementation, do not block waiting for it.
+			if present, _, err := pp.Has(".main-container .user .link-wrapper .channel"); err == nil && present {
+				logrus.Info("qr login: authenticated user sidebar detected")
 				return true
 			}
 		}
