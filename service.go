@@ -207,7 +207,10 @@ func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeRe
 		return nil, err
 	}
 
-	timeout := 4 * time.Minute
+	// Keep the server-side QR reuse window shorter than the site's QR validity.
+	// Otherwise repeated get_login_qrcode calls can return an already-expired image.
+	// This also bounds the background watcher; a later request starts a fresh QR session.
+	timeout := 90 * time.Second
 
 	if !loggedIn {
 		s.waitScanInBackground(loginAction, page, b.Close, timeout, img)
