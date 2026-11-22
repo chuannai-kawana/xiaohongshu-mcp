@@ -97,7 +97,7 @@ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error
 	start := time.Now()
 
 	logrus.Info("qr login: navigating to explore")
-	if err := pp.Navigate("https://www.xiaohongshu.com/explore"); err != nil {
+	if err := pp.Navigate("https://www.xiaohongshu.com/login"); err != nil {
 		logrus.Warnf("qr login: navigation failed after %s: %v", time.Since(start), err)
 		return "", false, errors.Wrap(err, "qr login navigation failed")
 	}
