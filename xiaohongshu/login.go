@@ -103,6 +103,31 @@ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error
 	}
 	logrus.Infof("qr login: navigation returned after %s; waiting for login dialog", time.Since(start))
 
+	// Inspect only structural signals for troubleshooting; never log QR data,
+	// cookies, account information or raw page HTML.
+	if info, err := pp.Eval(`() => {
+		const cls = (e) => typeof e.className === 'string' ? e.className.slice(0, 100) : '';
+		const clickable = Array.from(document.querySelectorAll('button, a, [role="button"], span, div'))
+			.filter(e => ['登录','立即登录','扫码登录','登录/注册','登录 / 注册'].includes((e.textContent||'').trim()))
+			.slice(0, 12).map(e => e.tagName + '.' + cls(e));
+		const imgs = Array.from(document.querySelectorAll('img'))
+			.filter(e => /login|qr|code/i.test(cls(e) + ' ' + cls(e.parentElement)))
+			.slice(0, 15).map(e => e.tagName + '.' + cls(e) + ' in ' + cls(e.parentElement));
+		return JSON.stringify({
+			path: location.pathname, ready: document.readyState,
+			title: document.title.slice(0, 70),
+			loginContainers: document.querySelectorAll('.login-container').length,
+			qrcodeImgs: document.querySelectorAll('.qrcode-img').length,
+			loginTextMatches: clickable, loginRelatedImgs: imgs,
+			iframeCount: document.querySelectorAll('iframe').length
+		});
+	}`); err == nil {
+		logrus.Infof("qr login: page structure: %s", info.Value.Str())
+	} else {
+		logrus.Warnf("qr login: page diagnostic failed: %v", err)
+	}
+
+
 	// Only inspect QR-code-looking images. Generic images could be avatars or
 	// decorative icons and must not be exposed as a login QR code.
 	selectors := []string{
