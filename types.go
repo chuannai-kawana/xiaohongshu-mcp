@@ -61,8 +61,9 @@ type SearchFeedsRequest struct {
 
 // FeedDetailResponse Feed详情响应
 type FeedDetailResponse struct {
-	FeedID string `json:"feed_id"`
-	Data   any    `json:"data"`
+	FeedID       string `json:"feed_id"`
+	Data         any    `json:"data"`
+	UIDiagnostic string `json:"ui_diagnostic,omitempty"`
 }
 
 // PostCommentRequest 发表评论请求
