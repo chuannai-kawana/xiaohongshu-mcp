@@ -11,6 +11,11 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// Browser-backed MCP tools are serialized on this small Railway instance.
+// Concurrent Chrome processes can exhaust the 1 GB memory limit and cause
+// 45-second upstream timeouts. Waiting calls respect their own cancellation.
+var browserToolSlot = make(chan struct{}, 1)
+
 // Helper functions for annotation pointers
 func boolPtr(b bool) *bool { return &b }
 
@@ -174,6 +179,15 @@ func withPanicRecovery[T any](
 			}
 		}()
 
+		select {
+		case browserToolSlot <- struct{}{}:
+			defer func() { <-browserToolSlot }()
+		case <-ctx.Done():
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: "服务繁忙，等待浏览器资源超时，请稍后再试"}},
+				IsError: true,
+			}, nil, nil
+		}
 		return handler(ctx, req, args)
 	}
 }
