@@ -116,7 +116,10 @@ func (f *CommentFeedAction) PostComment(ctx context.Context, feedID, xsecToken, 
 		logrus.Warnf("评论提交按钮未找到: %s", commentEditorDiagnostic(page))
 		return fmt.Errorf("评论已输入，但未找到提交按钮，未发送")
 	}
-	if err := humanize.Click(submit); err != nil { return fmt.Errorf("点击提交按钮失败: %w", err) }
+	// Submit is rendered and visible, but WaitInteractable can stall on
+	// the comment overlay; a no-wait mouse click still checks hit geometry.
+	if err := submit.ScrollIntoView(); err != nil { return fmt.Errorf("定位提交按钮失败: %w", err) }
+	if err := humanize.ClickNoWait(submit); err != nil { return fmt.Errorf("点击提交按钮失败: %w", err) }
 	humanize.Delay(ctx, humanize.AfterClick)
 	if !waitCommentRendered(page, content, 5*time.Second) {
 		logrus.Warnf("点击提交后未在评论列表确认，需人工检查是否发布: feed=%s", feedID)
