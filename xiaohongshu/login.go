@@ -18,23 +18,34 @@ func NewLogin(page *rod.Page) *LoginAction {
 	return &LoginAction{page: page}
 }
 
-func (a *LoginAction) CheckLoginStatus(ctx context.Context) (bool, error) {
-	// 加超时保护：只是查登录态的快速检查，不应无限挂（登录扫码的等待在 Login/WaitForLogin 里）
-	pp := a.page.Context(ctx).Timeout(30 * time.Second)
-	pp.MustNavigate("https://www.xiaohongshu.com/explore").MustWaitLoad()
-
-	time.Sleep(1 * time.Second)
-
-	exists, _, err := pp.Has(`.main-container .user .link-wrapper .channel`)
+// hasSessionCookie checks for Xiaohongshu's authenticated web session without
+// exposing any cookie value to logs. A1 alone is also set for guests.
+func hasSessionCookie(page *rod.Page) bool {
+	cs, err := page.Browser().GetCookies()
 	if err != nil {
-		return false, errors.Wrap(err, "check login status failed")
+		return false
 	}
-
-	if !exists {
-		return false, errors.Wrap(err, "login status element not found")
+	for _, c := range cs {
+		if c.Name == "web_session" && c.Value != "" {
+			return true
+		}
 	}
+	return false
+}
 
-	return true, nil
+func (a *LoginAction) CheckLoginStatus(ctx context.Context) (bool, error) {
+	pp := a.page.Context(ctx).Timeout(20 * time.Second)
+	// The old /explore route can redirect to international RedNote; its
+	// legacy sidebar selector is not present on the Chinese login route.
+	if err := pp.Navigate("https://www.xiaohongshu.com/login"); err != nil {
+		return false, errors.Wrap(err, "navigate to login status page failed")
+	}
+	time.Sleep(2 * time.Second)
+	if hasSessionCookie(pp) {
+		return true, nil
+	}
+	// A missing session cookie is a negative result, not a navigation error.
+	return false, nil
 }
 
 // CurrentUser 当前登录用户的基础信息。
@@ -194,6 +205,11 @@ func (a *LoginAction) WaitForLogin(ctx context.Context) bool {
 		case <-ctx.Done():
 			return false
 		case <-ticker.C:
+			// Detect the post-scan web_session cookie. The old sidebar
+			// selector does not exist on /login and misses confirmed scans.
+			if hasSessionCookie(pp) {
+				return true
+			}
 			el, err := pp.Element(".main-container .user .link-wrapper .channel")
 			if err == nil && el != nil {
 				return true
