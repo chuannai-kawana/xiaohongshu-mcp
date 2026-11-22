@@ -164,8 +164,7 @@ func installCommentSubmitRecorder(page *rod.Page) {
 		window.__xhsCommentSubmitProbe = history;
 		return 'installed';
 	}`)
-	if err != nil { logrus.Warnf("评论发送诊断初始化失败: %v",err) }
-	else { logrus.Infof("评论发送诊断状态: %s",res.Value.Str()) }
+	if err != nil { logrus.Warnf("评论发送诊断初始化失败: %v",err) } else { logrus.Infof("评论发送诊断状态: %s",res.Value.Str()) }
 }
 
 func commentSubmitRecorderReport(page *rod.Page, content string) string {
