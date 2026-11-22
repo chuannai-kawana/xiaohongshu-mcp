@@ -445,7 +445,37 @@ func (s *XiaohongshuService) GetFeedDetailWithConfig(ctx context.Context, feedID
 		FeedID: feedID,
 		Data:   result,
 	}
-
+	// Safe read-only page health signals. Never export account IDs, cookies,
+	// QR values, private text, or the contents of a comment.
+	if diag, e := page.Context(ctx).Timeout(4*time.Second).Eval(`() => {
+		const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+			&& getComputedStyle(el).visibility !== 'hidden'
+			&& getComputedStyle(el).display !== 'none';
+		const user = window.__INITIAL_STATE__?.user?.userInfo?.value ||
+			window.__INITIAL_STATE__?.user?.userInfo || null;
+		const count = selector => [...document.querySelectorAll(selector)].filter(visible).length;
+		const buttons = [...document.querySelectorAll('button.submit')].slice(0,5).map(el => {
+			const r=el.getBoundingClientRect();
+			const hit=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);
+			return {
+				className:String(el.className).slice(0,60), disabled:!!el.disabled,
+				visible:visible(el), parentClass:String(el.parentElement?.className||'').slice(0,60),
+				hitClass:String(hit?.className||'').slice(0,60),
+			};
+		});
+		return JSON.stringify({
+			path: location.pathname,
+			loginDialogCount:count('.login-container, .login-modal, [class*="login-modal"], [class*="loginModal"]'),
+			loginQrCount:count('.qrcode-img, img.qrcode'),
+			modalCount:count('[role="dialog"], .modal, .el-dialog'),
+			guestUserState:user?.guest===true,
+			hasUserState:!!user && user.guest!==true && !!(user.userId||user.user_id||user.nickname),
+			commentEditorCount:count('p.content-input[contenteditable]'),
+			buttons,
+		});
+	}`); e == nil {
+		response.UIDiagnostic = diag.Value.Str()
+	}
 	return response, nil
 }
 
