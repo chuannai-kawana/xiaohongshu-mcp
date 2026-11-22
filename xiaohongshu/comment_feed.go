@@ -26,7 +26,9 @@ func findVisibleCommentElement(page *rod.Page, selectors []string, timeout time.
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		for _, selector := range selectors {
-			if found, el, err := page.Timeout(2 * time.Second).Has(selector); err == nil && found && el != nil {
+			// Do not use page.Timeout(2s).Has here: elements inherit that short
+			// context, so a later humanized click fails before it completes.
+			if found, el, err := page.Has(selector); err == nil && found && el != nil {
 				if visible, err := el.Visible(); err == nil && visible {
 					return el, nil
 				}
