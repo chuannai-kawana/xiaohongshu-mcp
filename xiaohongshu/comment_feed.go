@@ -96,6 +96,22 @@ func (f *CommentFeedAction) PostComment(ctx context.Context, feedID, xsecToken, 
 	}
 	// Contenteditable editors may fail WaitInteractable despite being visible.
 	// Focus the editable node directly; Type also validates writability.
+	// Some XHS layouts require a real click on the placeholder/container to
+	// expand the comment composer. Focus alone can leave submit opacity at zero.
+	activators := []string{
+		"div.input-box div.content-edit span",
+		"div.input-box div.content-edit",
+	}
+	if activator, err := findVisibleCommentElement(page, activators, 2*time.Second); err == nil {
+		if clickErr := humanize.ClickNoWait(activator); clickErr != nil {
+			logrus.Infof("评论框激活点击未成功（将继续聚焦）: %v", clickErr)
+		} else {
+			humanize.Delay(ctx, humanize.AfterClick)
+			if updated, err := findVisibleCommentElement(page, editors, 2*time.Second); err == nil {
+				elem = updated
+			}
+		}
+	}
 	if err := elem.Focus(); err != nil { return fmt.Errorf("聚焦评论输入框失败: %w", err) }
 	if err := humanize.Type(ctx, elem, content); err != nil { return fmt.Errorf("输入评论失败: %w", err) }
 	humanize.Delay(ctx, humanize.AfterType)
@@ -119,7 +135,10 @@ func (f *CommentFeedAction) PostComment(ctx context.Context, feedID, xsecToken, 
 	// Submit is rendered and visible, but WaitInteractable can stall on
 	// the comment overlay; a no-wait mouse click still checks hit geometry.
 	if err := submit.ScrollIntoView(); err != nil { return fmt.Errorf("定位提交按钮失败: %w", err) }
-	if err := humanize.ClickNoWait(submit); err != nil { return fmt.Errorf("点击提交按钮失败: %w", err) }
+	if err := humanize.ClickNoWait(submit); err != nil {
+		logrus.Warnf("提交按钮无法点击；页面诊断: %s", commentEditorDiagnostic(page))
+		return fmt.Errorf("点击提交按钮失败: %w", err)
+	}
 	humanize.Delay(ctx, humanize.AfterClick)
 	if !waitCommentRendered(page, content, 5*time.Second) {
 		logrus.Warnf("点击提交后未在评论列表确认，需人工检查是否发布: feed=%s", feedID)
