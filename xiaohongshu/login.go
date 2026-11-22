@@ -217,9 +217,12 @@ func currentQRLoginStage(page *rod.Page) string {
 			.some(visible);
 		// Text such as "验证码登录" can be a static alternative login tab.
 		// A visible QR alone is not evidence that a code must be entered.
-		const sms = codeInput && /短信验证码|手机验证码|短信校验码|获取短信验证码/i.test(b);
-		const generic = codeInput ||
-			(!qr && /安全验证|请输入验证码|验证码已发送|输入验证码|身份验证|人机验证/i.test(b));
+		// A visible QR code is still the active login step: sites often keep
+		// an alternative "短信验证码登录" tab/input in the same document.
+		// Treat an OTP as REQUIRED only after the QR step is no longer visible.
+		const sms = !qr && codeInput && /短信验证码|手机验证码|短信校验码|获取短信验证码/i.test(b);
+		const generic = !qr && (codeInput ||
+			/安全验证|请输入验证码|验证码已发送|输入验证码|身份验证|人机验证/i.test(b));
 		const user = window.__INITIAL_STATE__?.user?.userInfo?.value ||
 			window.__INITIAL_STATE__?.user?.userInfo;
 		const authenticated = !!user && (user.guest === false ||
