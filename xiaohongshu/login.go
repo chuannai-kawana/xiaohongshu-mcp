@@ -133,12 +133,29 @@ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error
 	selectors := []string{
 		".login-container .qrcode-img",
 		".login-container img.qrcode",
-		".login-container img[src^='data:image/']",
 		".qrcode-container img",
 	}
+	didInspect := false
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		if !didInspect && time.Since(start) >= 6*time.Second {
+			didInspect = true
+			if v, err := pp.Eval(`() => {
+				const cls = e => typeof e.className === 'string' ? e.className.slice(0,100) : '';
+				const els = Array.from(document.querySelectorAll('button, [role="button"], a, input, .login-container, .login-container *'))
+					.filter(e => {
+						const t = (e.innerText || e.getAttribute('placeholder') || '').trim();
+						return e.matches('button, input, [role="button"]') || /登录|扫码|二维码/.test(t) && t.length < 24;
+					}).slice(0,40).map(e => [e.tagName,cls(e),(e.innerText||e.getAttribute('placeholder')||'').trim().slice(0,35)]);
+				const imgs = Array.from(document.querySelectorAll('img')).slice(0,30).map(e => [cls(e),e.alt||'',e.naturalWidth,e.naturalHeight,cls(e.parentElement)]);
+				return JSON.stringify({host:location.hostname,path:location.pathname,ready:document.readyState,items:els,images:imgs});
+			}`); err == nil {
+				logrus.Infof("qr login: loaded page structural diagnostic: %s", v.Value.Str())
+			} else {
+				logrus.Warnf("qr login: structural diagnostic failed: %v", err)
+			}
+		}
 		if opCtx.Err() != nil {
 			logrus.Warnf("qr login: no QR image after %s (dialog absent or page blocked)", time.Since(start))
 			return "", false, errors.Wrap(opCtx.Err(), "qr login image not found within 45s")
