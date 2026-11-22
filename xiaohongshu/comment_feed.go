@@ -39,6 +39,28 @@ func findVisibleCommentElement(page *rod.Page, selectors []string, timeout time.
 	return nil, fmt.Errorf("not found: %v", selectors)
 }
 
+// findActiveSubmitElement enumerates ALL matches. Older lookup used Has(),
+// which picked the first DOM match even if an invisible duplicate submit
+// appeared ahead of the actual enabled button.
+func findActiveSubmitElement(page *rod.Page, selectors []string, timeout time.Duration) (*rod.Element, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, selector := range selectors {
+			elems, err := page.Elements(selector)
+			if err != nil { continue }
+			for _, el := range elems {
+				visible, err := el.Visible()
+				if err != nil || !visible || !humanize.Visible(el) { continue }
+				disabled, err := el.Eval("() => this.disabled === true || this.getAttribute('aria-disabled') === 'true'")
+				if err != nil || disabled.Value.Bool() { continue }
+				return el, nil
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("no visible enabled submit button")
+}
+
 // Diagnostic deliberately avoids logging private cookies, text, or user identifiers.
 func commentEditorDiagnostic(page *rod.Page) string {
 	res, err := page.Timeout(3 * time.Second).Eval(`() => {
@@ -125,13 +147,13 @@ func (f *CommentFeedAction) PostComment(ctx context.Context, feedID, xsecToken, 
 	}
 	logrus.Infof("评论文本已输入并校验，准备查找发布按钮: feed=%s", feedID)
 	submitSelectors := []string{
-		"div.bottom button.submit",
+		"button.btn.submit",
 		".input-box button.submit",
+		"div.bottom button.submit",
 		".interact-container button.submit",
 		".interact-container button[class*='submit']",
-		".input-box button[class*='submit']",
 	}
-	submit, err := findVisibleCommentElement(page, submitSelectors, 7*time.Second)
+	submit, err := findActiveSubmitElement(page, submitSelectors, 7*time.Second)
 	if err != nil {
 		logrus.Warnf("评论提交按钮未找到: %s", commentEditorDiagnostic(page))
 		return fmt.Errorf("评论已输入，但未找到提交按钮，未发送")
