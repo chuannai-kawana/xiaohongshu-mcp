@@ -76,7 +76,12 @@ func commentEditorDiagnostic(page *rod.Page) string {
 				disabled:el.disabled,ariaDisabled:el.getAttribute('aria-disabled'),
 				className:String(el.className).slice(0,100),opacity:getComputedStyle(el).opacity,
 				parentOpacity:getComputedStyle(el.parentElement).opacity,
-				visible:!!(el.offsetWidth||el.offsetHeight||el.getClientRects().length)
+				visible:!!(el.offsetWidth||el.offsetHeight||el.getClientRects().length),
+				parentClass:String(el.parentElement?.className||'').slice(0,80),
+				parent2Class:String(el.parentElement?.parentElement?.className||'').slice(0,80),
+				bounding:((r)=>({x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)}))(el.getBoundingClientRect()),
+				pointerEvents:getComputedStyle(el).pointerEvents,
+				visibility:getComputedStyle(el).visibility
 			}))});
 	}`)
 	if err != nil { return "unavailable: " + err.Error() }
@@ -147,6 +152,9 @@ func (f *CommentFeedAction) PostComment(ctx context.Context, feedID, xsecToken, 
 	}
 	logrus.Infof("评论文本已输入并校验，准备查找发布按钮: feed=%s", feedID)
 	submitSelectors := []string{
+		// XHS renders two submit buttons in different component wrappers.
+		// The actual enabled one may be a bare "submit", not "btn submit".
+		"button.submit",
 		"button.btn.submit",
 		".input-box button.submit",
 		"div.bottom button.submit",
