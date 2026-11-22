@@ -43,10 +43,42 @@ func (s *AppServer) handleCheckLoginStatus(ctx context.Context) *MCPToolResult {
 	}
 
 	var resultText string
-	if status.IsLoggedIn {
-		resultText = fmt.Sprintf("✅ 已登录\n用户名: %s\n\n你可以使用其他功能了。", status.Username)
+	if status.QRActive {
+		switch status.QRStage {
+		case "sms_verification_required":
+			resultText = "📱 小红书网页要求短信验证码。请在小红书官方验证界面完成验证；不要把验证码发送到聊天中。当前服务器无法在后台浏览器里代填验证码。"
+		case "verification_required":
+			resultText = "🔐 小红书网页正在要求额外身份验证。请在官方验证界面完成操作；暂不能确认登录成功。"
+		case "waiting_phone_confirmation":
+			resultText = "📱 二维码已进入等待手机确认阶段，请在小红书 App 内确认。"
+		case "phone_confirmed", "session_received":
+			resultText = "⏳ 手机端已显示确认信号，正在等待网页会话建立和 Cookie 保存。"
+		case "waiting_for_scan":
+			resultText = "🔳 二维码等待扫码中。请尽量在有效期内完成手机端操作。"
+		default:
+			resultText = "⏳ 网页登录流程进行中，当前阶段：" + status.QRStage
+		}
+		if status.QRExpiresAt != "" {
+			resultText += "\n扫码会话失效时间（UTC）：" + status.QRExpiresAt
+		}
+	} else if status.IsLoggedIn && status.WebAccountState == "authenticated" {
+		resultText = "✅ 网页已识别到已登录账号；用户会话与网页身份均已验证。"
+		if status.Username != "" { resultText += "\n用户名：" + status.Username }
+	} else if status.IsLoggedIn {
+		resultText = "⚠️ 找到了已保存的登录 Cookie，但网页尚未确认账号已登录。"
+		if status.WebAccountState == "guest" {
+			resultText += "\n小红书笔记页面仍识别为访客，发表评论等操作可能不可用。"
+		} else {
+			resultText += "\n当前网页验证状态未知，不能保证发表评论权限。"
+		}
 	} else {
-		resultText = "❌ 未登录\n\n请使用 get_login_qrcode 工具获取二维码进行登录。"
+		resultText = "❌ 未发现可用的已保存登录 Cookie。"
+		if status.QRStage == "verification_timed_out" {
+			resultText += "\n上次扫码曾进入额外验证阶段，但会话已结束。"
+		} else if status.QRStage == "qr_expired_or_cancelled" {
+			resultText += "\n上次扫码会话已结束或过期。"
+		}
+		resultText += "\n可通过 get_login_qrcode 开始新一轮登录。"
 	}
 
 	return &MCPToolResult{
