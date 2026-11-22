@@ -94,7 +94,9 @@ func (f *CommentFeedAction) PostComment(ctx context.Context, feedID, xsecToken, 
 			return fmt.Errorf("未找到可编辑的评论输入框：请检查小红书网页端布局")
 		}
 	}
-	if err := humanize.Click(elem); err != nil { return fmt.Errorf("聚焦评论输入框失败: %w", err) }
+	// Contenteditable editors may fail WaitInteractable despite being visible.
+	// Focus the editable node directly; Type also validates writability.
+	if err := elem.Focus(); err != nil { return fmt.Errorf("聚焦评论输入框失败: %w", err) }
 	if err := humanize.Type(ctx, elem, content); err != nil { return fmt.Errorf("输入评论失败: %w", err) }
 	humanize.Delay(ctx, humanize.AfterType)
 	typed, err := elem.Text()
