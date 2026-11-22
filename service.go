@@ -182,6 +182,10 @@ func (s *XiaohongshuService) CheckLoginStatus(ctx context.Context) (*LoginStatus
 
 // GetLoginQrcode 获取登录的扫码二维码
 func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeResponse, error) {
+	if img, remaining, ok := s.logins.currentQR(); ok {
+		logrus.Info("qr login: reusing active login QR; pending confirmation was not cancelled")
+		return &LoginQrcodeResponse{Timeout: remaining.String(), Img: img}, nil
+	}
 	logrus.Info("qr login: initializing browser")
 	b := newBrowser()
 	logrus.Info("qr login: browser initialized")
@@ -206,7 +210,7 @@ func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeRe
 	timeout := 4 * time.Minute
 
 	if !loggedIn {
-		s.waitScanInBackground(loginAction, page, b.Close, timeout)
+		s.waitScanInBackground(loginAction, page, b.Close, timeout, img)
 		handedOff = true
 	}
 
@@ -227,10 +231,10 @@ func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeRe
 // 浏览器必须一直活着才检测得到扫码，所以这里不能提前关；但也不能任由它堆积——
 // 再取一次二维码就会把上一个还在等的会话关掉，同一时刻只留一个。
 func (s *XiaohongshuService) waitScanInBackground(
-	loginAction *xiaohongshu.LoginAction, page *rod.Page, closeBrowser func(), timeout time.Duration,
+	loginAction *xiaohongshu.LoginAction, page *rod.Page, closeBrowser func(), timeout time.Duration, qrImage string,
 ) {
 	ctxTimeout, cancel := context.WithTimeout(context.Background(), timeout)
-	seq := s.logins.start(cancel, timeout)
+	seq := s.logins.start(cancel, timeout, qrImage)
 	logrus.Infof("等待扫码登录，会话 #%d，超时 %s", seq, timeout)
 
 	go func() {

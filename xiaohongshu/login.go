@@ -270,9 +270,15 @@ func (a *LoginAction) WaitForLoginWithStage(ctx context.Context, stageChanged fu
 				lastStage = stage
 			}
 			if stage == "sms_verification_required" || stage == "verification_required" {
-				// A mobile prompt may be accepted but the browser is waiting
-				// for an additional verification step. Do not save guest cookies.
+				// 官方验证尚未完成，不能保存访客 Cookie。
 				continue
+			}
+			if stage == "web_authenticated" {
+				logrus.Info("qr login: authenticated web state detected")
+				if stageChanged != nil {
+					stageChanged("session_received")
+				}
+				return true
 			}
 			if cs, err := pp.Browser().GetCookies(); err == nil {
 				for _, c := range cs {
