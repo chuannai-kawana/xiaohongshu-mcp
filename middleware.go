@@ -58,3 +58,23 @@ func errorHandlingMiddleware() gin.HandlerFunc {
 			"服务器内部错误", recovered)
 	})
 }
+
+// browserTrafficLimiter prevents parallel MCP/API requests from launching
+// multiple Chromium processes on the 1 GB Railway instance. In particular,
+// a duplicate write request cannot queue behind another write and then post
+// unexpectedly when the first finishes. Health checks remain unrestricted.
+func browserTrafficLimiter() gin.HandlerFunc {
+    slots := make(chan struct{}, 1)
+    return func(c *gin.Context) {
+        select {
+        case slots <- struct{}{}:
+            defer func() { <-slots }()
+            c.Next()
+        default:
+            c.Header("Retry-After", "5")
+            c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+                "error": "浏览器正在处理另一项请求，请稍后重试",
+            })
+        }
+    }
+}
