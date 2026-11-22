@@ -3,14 +3,9 @@ package xiaohongshu
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"strings"
-	"net/url"
-	"os"
 	"time"
 
 	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/proto"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -23,64 +18,34 @@ func NewLogin(page *rod.Page) *LoginAction {
 	return &LoginAction{page: page}
 }
 
-// authCheckPage returns the site page used to verify an actually signed-in
-// account. It can be set to a public note URL and is restricted to XHS HTTPS.
-func authCheckPage() string {
-	fallback := "https://www.xiaohongshu.com/explore"
-	raw := os.Getenv("XHS_AUTH_CHECK_URL")
-	if raw == "" { return fallback }
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.Host != "www.xiaohongshu.com" ||
-		u.User != nil || u.Fragment != "" { return fallback }
-	return raw
-}
-
-func sessionCookieValue(page *rod.Page) string {
+// hasSessionCookie checks for Xiaohongshu's authenticated web session without
+// exposing any cookie value to logs. A1 alone is also set for guests.
+func hasSessionCookie(page *rod.Page) bool {
 	cs, err := page.Browser().GetCookies()
-	if err != nil { return "" }
-	for _, c := range cs {
-		if c.Name == "web_session" { return c.Value }
-	}
-	return ""
-}
-
-// authenticatedUserState checks the site's actual user state rather than
-// mistaking a stale web_session cookie for a valid login.
-func authenticatedUserState(page *rod.Page) bool {
-	r, err := page.Timeout(3 * time.Second).Eval(`() => {
-		const u = window.__INITIAL_STATE__?.user?.userInfo?.value ||
-			window.__INITIAL_STATE__?.user?.userInfo;
-		return !!u && (u.guest === false ||
-			(u.guest !== true && !!(u.userId || u.user_id || u.nickname)));
-	}`)
-	return err == nil && r.Value.Bool()
-}
-
-func verifyAuthenticatedPage(page *rod.Page, ctx context.Context) bool {
-	pp := page.Context(ctx).Timeout(18 * time.Second)
-	if err := pp.Navigate(authCheckPage()); err != nil {
-		logrus.Warnf("auth check navigation failed: %v", err)
+	if err != nil {
 		return false
 	}
-	ticker := time.NewTicker(400 * time.Millisecond)
-	defer ticker.Stop()
-	timeout := time.NewTimer(8 * time.Second)
-	defer timeout.Stop()
-	for {
-		if authenticatedUserState(pp) { return true }
-		select {
-		case <-ctx.Done(): return false
-		case <-timeout.C: return false
-		case <-ticker.C:
+	for _, c := range cs {
+		if c.Name == "web_session" && c.Value != "" {
+			return true
 		}
 	}
+	return false
 }
 
 func (a *LoginAction) CheckLoginStatus(ctx context.Context) (bool, error) {
-	if sessionCookieValue(a.page) == "" { return false, nil }
-	// The previous implementation only checked this cookie and returned
-	// success for guests. Verify the user identity flag on a content page.
-	return verifyAuthenticatedPage(a.page, ctx), nil
+	pp := a.page.Context(ctx).Timeout(20 * time.Second)
+	// The old /explore route can redirect to international RedNote; its
+	// legacy sidebar selector is not present on the Chinese login route.
+	if err := pp.Navigate("https://www.xiaohongshu.com/login"); err != nil {
+		return false, errors.Wrap(err, "navigate to login status page failed")
+	}
+	time.Sleep(2 * time.Second)
+	if hasSessionCookie(pp) {
+		return true, nil
+	}
+	// A missing session cookie is a negative result, not a navigation error.
+	return false, nil
 }
 
 // CurrentUser 当前登录用户的基础信息。
@@ -230,75 +195,25 @@ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error
 	}
 }
 
-// WaitForLogin monitors QR login without navigating away from the scan page.
-// Mobile "login successful" can arrive before XHS hydrates its web user state.
-// We retry identity verification instead of closing the session prematurely.
 func (a *LoginAction) WaitForLogin(ctx context.Context) bool {
 	pp := a.page.Context(ctx)
-	initialCookie := sessionCookieValue(pp)
-	logrus.Infof("qr login: starting monitor; initial session cookie present=%t", initialCookie != "")
-	ticker := time.NewTicker(750 * time.Millisecond)
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-	lastState := ""
-	lastVerify := time.Time{}
-	verifiedAttempts := 0
+
 	for {
 		select {
 		case <-ctx.Done():
-			logrus.Infof("qr login: monitor ended; verification attempts=%d, last signal=%s",verifiedAttempts,lastState)
 			return false
 		case <-ticker.C:
-			if authenticatedUserState(pp) {
-				logrus.Info("qr login: authenticated web user state detected directly on QR page")
+			// Detect the post-scan web_session cookie. The old sidebar
+			// selector does not exist on /login and misses confirmed scans.
+			if hasSessionCookie(pp) {
 				return true
 			}
-			current := sessionCookieValue(pp)
-			hasChanged := current != "" && current != initialCookie
-			qrStage := "unknown"
-			// Structural signals only: no QR values, account data, cookies or
-			// page text are exposed to the log.
-			if r, err := pp.Timeout(2*time.Second).Eval(`() => {
-				const text = (document.body?.innerText || '');
-				const img = document.querySelector('.login-container .qrcode-img');
-				const qrVisible = !!img && !!(img.offsetWidth||img.offsetHeight||img.getClientRects().length);
-				return JSON.stringify({
-					path:location.pathname,
-					qrVisible,
-					scanConfirmed:/扫码成功|登录成功|已登录|已确认登录/.test(text),
-					needsConfirmation:/已扫码|等待确认|请在手机上确认/.test(text),
-				});
-			}`); err==nil { qrStage = r.Value.Str() }
-			state := fmt.Sprintf("cookiePresent=%t cookieChanged=%t qr=%s",
-				current!="",hasChanged,qrStage)
-			if state != lastState {
-				logrus.Infof("qr login: monitor state changed: %s",state)
-				lastState = state
-			}
-			// Don't assume an unchanged cookie means no scan; prior guest
-			// sessions can already have a non-empty web_session cookie.
-			// Verify after a change OR when the QR page indicates a scan.
-			signal := hasChanged || strings.Contains(qrStage, "\"scanConfirmed\":true") ||
-				strings.Contains(qrStage, "\"needsConfirmation\":true") ||
-				strings.Contains(qrStage, "\"qrVisible\":false")
-			if current == "" || !signal || time.Since(lastVerify) < 8*time.Second {
-				continue
-			}
-			lastVerify = time.Now()
-			verifiedAttempts++
-			// Use a separate tab. Navigating the original QR page would
-			// destroy the pending scan session after an early negative check.
-			checkPage, err := pp.Browser().Page(proto.TargetCreateTarget{URL:"about:blank"})
-			if err != nil {
-				logrus.Warnf("qr login: verification tab creation failed: %v",err)
-				continue
-			}
-			verified := verifyAuthenticatedPage(checkPage, ctx)
-			_ = checkPage.Close()
-			if verified {
-				logrus.Infof("qr login: confirmed authenticated web account after %d verification attempts",verifiedAttempts)
+			el, err := pp.Element(".main-container .user .link-wrapper .channel")
+			if err == nil && el != nil {
 				return true
 			}
-			logrus.Warn("qr login: web account still guest; keeping QR session alive for retry")
 		}
 	}
 }
