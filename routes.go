@@ -40,6 +40,7 @@ func setupRoutes(appServer *AppServer) *gin.Engine {
 	mcpHTTPHandler := http.NewCrossOriginProtection().Handler(mcpHandler)
 	protected := router.Group("")
 	protected.Use(authMiddleware(appServer.authToken))
+	protected.Use(browserTrafficLimiter())
 
 	protected.Any("/mcp", gin.WrapH(mcpHTTPHandler))
 	protected.Any("/mcp/*path", gin.WrapH(mcpHTTPHandler))
